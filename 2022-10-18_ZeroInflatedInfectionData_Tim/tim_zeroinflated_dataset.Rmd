@@ -1,0 +1,162 @@
+---
+title: "Modelling Bd load against Jliv; handling zero-inflated dataset"
+author: "MYC"
+date: "2022-10-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(pscl)
+library(quantreg)
+library(MASS)
+library(tidyverse)
+```
+
+```` {r }
+# Load in dataset; adjust some Bd/Jliv numbers
+dat <- read.csv("FigDataBd5.csv") %>%
+  mutate(DaysFactor = factor(DaysSince)
+         , DaysContinuous = DaysSince
+         ,logJliv=log(JlivNum+1)
+         ,Bd=round(exp(LogBd)-1))
+````
+
+## Visual exploration
+
+First, let's look at the data:
+````{r prelimPlot, echo=FALSE}
+ggplot(dat,aes(x=log(JlivNum+1), y=LogBd, col=DaysFactor)) +
+  geom_point() +
+  geom_smooth(method="lm", se = FALSE, alpha=0.25)
+````
+
+So it turns out that day 345 doesn't have any Jliv on any toads. This means that it is not actually useful for testing whether Jliv results in less Bd. Let's remove this day.
+
+
+``` {r}
+dat_filt <- dat %>% filter(DaysSince!=345)
+```
+
+Now, let's look at Bd distribution.
+
+``` {r}
+dat_filt %>%
+  ggplot() +
+  geom_histogram(aes(x=LogBd, group=DaysFactor, fill=DaysFactor), position = "dodge")
+```
+
+It also turns out that the data is not as zero-inflated as we might expect! A lot of the zeros are in the first sampling point, and the distribution within each day is actually pretty reasonable. The difference in Bd load between time points, and the fact that the relationship between Bd load and Jliv changes with each time point, makes me feel that we *should* include time. We can include time account for differences in Bd load at each time point; but then also to see if the slope between Jliv and Bd changes as time goes on.
+
+Let's try three approaches:
+
+* Linear Regression
+* Zero-inflated negative binomial (ZINB) 
+* Quantile regression
+
+In each model, we will include Jliv*Days (days as factor). In two-part models, we will also include DaysSince (numeric) as a predictor for Bd prevalence (0/1).
+
+### Linear Regression
+
+``` {r}
+##### Normal regression #####
+linear_ml <- lm(LogBd ~ logJliv*DaysFactor, data=dat_filt)
+summary(linear_ml)
+```
+
+Okay! So this tells us that Bd load is not predicted by Jliv on Day 15 (logJliv; p=0.5544), but that as time goes on Jliv becomes a better (and eventually significant) predictor of Bd load (logJliv:DaysFactor52; p=0.0452). Also, There is an obvious effect of time (DaysFactor30, DaysFactor52) where Bd load is higher at later time points.
+
+Let's look at residuals of model:
+
+```{r linear_residuals}
+# Plotting residuals
+plot(linear_ml$fitted.values, linear_ml$residuals, xlab="Fitted values", ylab="Residuals")
+```
+
+The fit is honestly not that bad. Most of the zeros are actually associated with day 15, and day 15 is generally low. So the data are not as heterskedastic as we'd feared. Let's overlay the model predictions + confidence intervals on the plot:
+
+```{r linear_model_visual }
+newdata <- data.frame(logJliv=rep(dat_filt$logJliv, 3)
+                      , DaysFactor = rep(unique(dat_filt$DaysFactor),
+                                         each=length(dat_filt$logJliv)))
+linear_ml_predict <- predict(linear_ml, newdata = newdata,interval = "confidence")
+LinearModelFit <- cbind(newdata, linear_ml_predict)
+
+ggplot(dat_filt) +
+  geom_point(aes(x=logJliv, y=LogBd, col=DaysFactor)) +
+  geom_line(data=LinearModelFit, aes(x=logJliv, y=fit, col=DaysFactor)) +
+  geom_ribbon(data=LinearModelFit, aes(x=logJliv, ymin=lwr, ymax=upr, fill=DaysFactor), alpha=0.25) +
+  ylab("Log Bd+1") + xlab("Log Jliv+1") + labs(fill="Sampling Day")
+
+```
+
+
+### Zero-inflated negative binomial
+
+Now, let's try a model that accounts for the increased zeros in Bd count.
+
+``` {r}
+##### Zero inflated negative binomial #####
+# logit part: time as continuous factor
+# negbin part: Jliv and time, interacting
+
+zinb_ml <- zeroinfl(Bd ~ logJliv*DaysFactor | DaysContinuous,
+               data = dat_filt, dist = "negbin", link="log")
+summary(zinb_ml)
+```
+What we see here, is:
+
+1. Bd prevalence (0/1) is higher as time goes on (DaysContinuous; p = 0.01)
+
+2. Jliv has no effect on Bd load on Day 15 (logJliv; p=0.9512)
+
+3. The effect of Jliv has a significant effect on Bd load (relative to day 15) on Day 52 (logJliv:DaysFactor52, p=0.0457)
+
+This tells us the same thing as the linear model: that as time goes on, the "effect" of Jliv on Bd load becomes more pronounced. Below, I've plotted the model fit onto data.
+
+```{r zinb_model_visual }
+newdata <- data.frame(logJliv=rep(dat_filt$logJliv, 3)
+                      , DaysFactor = rep(unique(dat_filt$DaysFactor),
+                                         each=length(dat_filt$logJliv))
+                      , DaysContinuous = rep(unique(dat_filt$DaysContinuous),
+                                         each=length(dat_filt$logJliv)))
+zinb_ml_predict <- predict(zinb_ml, newdata = newdata)
+ZINBModelFit <- cbind(newdata, fit=log(zinb_ml_predict))
+
+ggplot(dat_filt) +
+  geom_point(aes(x=logJliv, y=LogBd, col=DaysFactor)) +
+  geom_line(data=ZINBModelFit, aes(x=logJliv, y=fit, col=DaysFactor)) +
+  ylab("Log Bd+1") + xlab("Log Jliv+1") + labs(fill="Sampling Day")
+
+```
+
+
+### Quantile Regression
+
+Finally, let's try a quantile regression, which uses the "limits" of the data to define the relationship between Bd and Jliv. This is useful because it treats zeros as just "part of the data below the quantile line", and doesn't assume anything about its distribution. Here, we use a "median", which should be similar to the effect of "mean" (a classic linear regression)
+
+
+```` {r }
+### Quantile Regression #####
+# using a quantile of 90
+quantreg_ml <- rq(LogBd ~ logJliv*DaysFactor, data=dat_filt, tau = 0.50)
+summary(quantreg_ml, se="boot") # Use bootstrapping to estimate confidence
+````
+
+We see the same story here: Jliv is associated with less Bd, but this effect is really only statistically significant at later time points (logJliv:DaysFactor52; p=0.036). Early on, there isn't an effect of Jliv ( logJliv; p = 0.068) but it's hard to say whether this is because there isn't enough Bd yet to see a difference, or if Jliv impacts long-term outcomes for Bd infection. The plot is below:
+
+```{r quantile_model_visual }
+newdata <- data.frame(logJliv=rep(dat_filt$logJliv, 3)
+                      , DaysFactor = rep(unique(dat_filt$DaysFactor),
+                                         each=length(dat_filt$logJliv)))
+quantreg_ml_predict <- predict(quantreg_ml, newdata = newdata, interval = "confidence")
+quantregModelFit <- cbind(newdata, quantreg_ml_predict)
+
+ggplot(dat_filt) +
+  geom_point(aes(x=logJliv, y=LogBd, col=DaysFactor)) +
+  geom_line(data=quantregModelFit, aes(x=logJliv, y=fit, col=DaysFactor)) +
+  geom_ribbon(data=quantregModelFit, aes(x=logJliv, ymin=lower, ymax=higher, fill=DaysFactor), alpha=0.25) +
+  ylab("Log Bd+1") + xlab("Log Jliv+1") + labs(fill="Sampling Day")
+
+```
